@@ -1,10 +1,10 @@
 {
-  "id": "zotero-abnt-references",
-  "name": "Zotero ABNT References",
-  "version": "1.0.0",
-  "minAppVersion": "0.15.0",
-  "description": "Mostra referências ABNT para citekeys Zotero na nota ativa",
-  "author": "Andre",
-  "authorUrl": "",
-  "isDesktopOnly": true
+	"id": "obsidian-zotero-abnt",
+	"name": "Zotero ABNT References",
+	"version": "1.0.0",
+	"minAppVersion": "1.0.0",
+	"description": "Sidebar for ABNT (NBR 6023) references from Zotero, with citekey autocomplete and smart navigation.",
+	"author": "andrekv",
+	"authorUrl": "https://github.com/andrekv",
+	"isDesktopOnly": true
 }
