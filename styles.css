@@ -1,0 +1,63 @@
+.abnt-container {
+  padding: 10px 12px;
+  font-family: var(--font-interface);
+  font-size: var(--nav-item-size);
+  line-height: 1.5;
+  color: var(--text-normal);
+}
+
+.abnt-header {
+  font-weight: var(--nav-item-weight);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 0.7em;
+  letter-spacing: 0.05em;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 8px;
+}
+
+.abnt-empty {
+  color: var(--text-faint);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+.abnt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.abnt-item {
+  border-left: 2px solid var(--interactive-accent);
+  padding-left: 12px;
+  transition: background-color 0.2s ease;
+}
+
+.abnt-item:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.abnt-item.abnt-error {
+  border-left-color: var(--text-error);
+}
+
+.abnt-reference {
+  margin: 0;
+  text-align: left;
+  word-wrap: break-word;
+  white-space: normal;
+}
+
+/* Ensure Zotero bolding (usually inside <span> or <b>) is visible */
+.abnt-reference b, 
+.abnt-reference strong {
+  font-weight: 700;
+  color: var(--text-normal);
+}
+
+.abnt-missing {
+  color: var(--text-error);
+  font-size: 0.9em;
+}
