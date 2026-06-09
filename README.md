@@ -1,3 +1,7 @@
+---
+created: 2026-05-29T00:39
+updated: 2026-06-04T13:35
+---
 # Obsidian Zotero ABNT
 
 Display Zotero references in ABNT (NBR 6023) format with a dedicated sidebar, citekey autocomplete, and smart editor navigation.
@@ -5,10 +9,11 @@ Display Zotero references in ABNT (NBR 6023) format with a dedicated sidebar, ci
 ## Features
 - **ABNT Formatting:** Automatically fetches correctly formatted references from Zotero via Better BibTeX.
 - **Interactive Sidebar:** Dedicated view to see all references found in your current note.
+- **Auto-Refresh & Manual Refresh:** References update automatically when the sidebar is opened, with a manual refresh command available via the palette.
 - **Click-to-Jump:** Click a reference in the sidebar to scroll directly to its location in the editor.
 - **Smart Links:** `Alt + Click` on any `@citekey` to open its bibliographic note in a new tab.
 - **Citekey Autocomplete:** Scan your vault for bibliographic notes and suggest citekeys as you type `@`.
-- **Rich Text Copy:** Command to copy formatted references (preserving bold/italic) to the clipboard.
+- **Clean Rich Text Copy:** Command to copy formatted references (preserving bold/italic) to the clipboard, automatically sanitized to a clean, one-per-line ABNT list.
 
 ## Installation
 
