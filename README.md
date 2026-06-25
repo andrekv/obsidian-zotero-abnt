@@ -1,7 +1,3 @@
----
-created: 2026-05-29T00:39
-updated: 2026-06-04T13:35
----
 # Obsidian Zotero ABNT
 
 Display Zotero references in ABNT (NBR 6023) format with a dedicated sidebar, citekey autocomplete, and smart editor navigation.
