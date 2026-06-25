@@ -1,6 +1,6 @@
 {
   "name": "obsidian-zotero-abnt",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",

@@ -1,18 +1,13 @@
-import { App, ItemView, Plugin, WorkspaceLeaf, debounce, Notice, MarkdownView, Editor, EditorSuggest, EditorSuggestContext, EditorPosition, EditorSuggestTriggerInfo, TFile, MarkdownPostProcessorContext } from "obsidian";
+import { App, ItemView, Plugin, WorkspaceLeaf, debounce, Notice, MarkdownView, Editor, EditorSuggest, EditorSuggestContext, EditorPosition, EditorSuggestTriggerInfo, TFile } from "obsidian";
 import * as http from "http";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const VIEW_TYPE_ABNT = "zotero-abnt-references";
-
-// Matches @citekey in any Pandoc-style context: [@key], [@key1; @key2], @key
-const CITEKEY_REGEX = /@([\w:_-]+)/g;
-
+const CITEKEY_REGEX = /\[@([\w:_-]+)\]/g;
 const BBT_HOSTNAME = "127.0.0.1";
 const BBT_PORT = 23119;
 const BBT_PATH = "/better-bibtex/json-rpc";
-
-// Official Zotero style ID for ABNT
 const ABNT_STYLE_ID = "associacao-brasileira-de-normas-tecnicas";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -71,23 +66,21 @@ class ABNTView extends ItemView {
   async onClose(): Promise<void> {}
 
   renderIdle(): void {
-    const el = this.containerEl.children[1] as HTMLElement;
+    const el = this.contentEl;
     el.empty();
     el.addClass("abnt-container");
     el.createEl("div", { cls: "abnt-empty", text: "Abra uma nota com referências." });
   }
 
   setLoading(): void {
-    const el = this.containerEl.children[1] as HTMLElement;
+    const el = this.contentEl;
     el.empty();
-    el.addClass("abnt-container");
     el.createEl("div", { cls: "abnt-empty", text: "Buscando referências no Zotero…" });
   }
 
   setError(msg: string): void {
-    const el = this.containerEl.children[1] as HTMLElement;
+    const el = this.contentEl;
     el.empty();
-    el.addClass("abnt-container");
     el.createEl("div", { cls: "abnt-missing", text: `Erro: ${msg}` });
     el.createEl("p", { 
       cls: "abnt-empty", 
@@ -101,7 +94,7 @@ class ABNTView extends ItemView {
   }
 
   render(): void {
-    const el = this.containerEl.children[1] as HTMLElement;
+    const el = this.contentEl;
     el.empty();
     el.addClass("abnt-container");
 
@@ -109,11 +102,6 @@ class ABNTView extends ItemView {
       el.createEl("div", { cls: "abnt-empty", text: "Nenhuma referência encontrada nesta nota." });
       return;
     }
-
-    el.createEl("div", {
-      cls: "abnt-header",
-      text: "References",
-    });
 
     const list = el.createEl("div", { cls: "abnt-list" });
 
@@ -141,14 +129,29 @@ class ABNTView extends ItemView {
         item.addEventListener("click", () => {
           this.navigateToCitekey(res.citekey);
         });
+        item.addEventListener("contextmenu", async (e) => {
+          e.preventDefault();
+          const rawRef = res.reference;
+          const plainText = rawRef.replace(/<.*?>/g, "").replace(/\s+/g, " ").trim();
+          const htmlText = `<div>${rawRef.replace(/\s+/g, " ").trim()}</div>`;
+          try {
+            const clipboardItem = new (window as any).ClipboardItem({
+              "text/plain": new Blob([plainText], { type: "text/plain" }),
+              "text/html": new Blob([htmlText], { type: "text/html" })
+            });
+            await navigator.clipboard.write([clipboardItem]);
+            new Notice("Referência copiada!");
+          } catch (err) {
+            await navigator.clipboard.writeText(plainText);
+            new Notice("Referência copiada!");
+          }
+        });
       }
     });
   }
 
   private async navigateToCitekey(citekey: string) {
     const { workspace } = this.app;
-    
-    // Find the current active leaf or one showing the active file
     const activeFile = workspace.getActiveFile();
     if (!activeFile) return;
 
@@ -157,19 +160,21 @@ class ABNTView extends ItemView {
     if (leaf && leaf.view instanceof MarkdownView) {
         workspace.setActiveLeaf(leaf, { focus: true });
         
-        // If in Reading Mode, switch to Source/Live Preview first to allow jump
         const state = leaf.getViewState();
         if (state.state?.mode === "preview") {
             state.state.mode = "source";
             await leaf.setViewState(state);
-            // Give it a tiny moment to switch
             await new Promise(r => setTimeout(r, 100));
         }
 
         const editor = leaf.view.editor;
         const content = editor.getValue();
-        const pattern = new RegExp(`@${citekey}`, "g");
-        const match = pattern.exec(content);
+        let pattern = new RegExp(`\\[@${citekey}\\]`, "g");
+        let match = pattern.exec(content);
+        if (!match) {
+            pattern = new RegExp(`@${citekey}`, "g");
+            match = pattern.exec(content);
+        }
 
         if (match) {
             const pos = editor.offsetToPos(match.index);
@@ -195,7 +200,7 @@ class CitekeySuggest extends EditorSuggest<string> {
   onTrigger(cursor: EditorPosition, editor: Editor, file: TFile): EditorSuggestTriggerInfo | null {
     const line = editor.getLine(cursor.line);
     const sub = line.substring(0, cursor.ch);
-    const match = sub.match(/@([\w:_-]*)$/);
+    const match = sub.match(/\[@([\w:_-]*)$/);
 
     if (match) {
       return {
@@ -218,7 +223,6 @@ class CitekeySuggest extends EditorSuggest<string> {
       if (fileCitekey) {
           const keys = Array.isArray(fileCitekey) ? fileCitekey.map(String) : [String(fileCitekey)];
           keys.forEach(k => {
-              // Sanitize: remove [@...] if present
               const clean = k.replace(/[\[\]@]/g, "");
               citekeys.push(clean);
           });
@@ -233,13 +237,13 @@ class CitekeySuggest extends EditorSuggest<string> {
   }
 
   renderSuggestion(value: string, el: HTMLElement): void {
-    el.createEl("div", { text: `@${value}` });
+    el.createEl("div", { text: `[@${value}]` });
   }
 
   selectSuggestion(value: string, evt: MouseEvent | KeyboardEvent): void {
     if (this.context) {
       const { editor, start, end } = this.context;
-      editor.replaceRange(`@${value}`, start, end);
+      editor.replaceRange(`[@${value}]`, start, end);
     }
   }
 }
@@ -248,6 +252,7 @@ class CitekeySuggest extends EditorSuggest<string> {
 
 export default class ZoteroABNTPlugin extends Plugin {
   private debouncedUpdate!: () => void;
+  private referenceCache: Map<string, ReferenceResult> = new Map();
 
   async onload(): Promise<void> {
     this.registerView(VIEW_TYPE_ABNT, (leaf) => new ABNTView(leaf));
@@ -255,6 +260,18 @@ export default class ZoteroABNTPlugin extends Plugin {
 
     this.addRibbonIcon("book-open", "Referências ABNT (Zotero)", () => {
       this.activateView();
+    });
+
+    this.addCommand({
+      id: "open-abnt-view",
+      name: "Open ABNT References View",
+      callback: () => this.activateView()
+    });
+
+    this.addCommand({
+      id: "refresh-abnt-references",
+      name: "Refresh references",
+      callback: () => this.updateReferences()
     });
 
     this.addCommand({
@@ -269,12 +286,16 @@ export default class ZoteroABNTPlugin extends Plugin {
 
         const cleanResults = view.results.filter(r => !r.error);
         const plainText = cleanResults
-          .map(r => r.reference.replace(/<.*?>/g, "").trim())
-          .join("\n\n");
+          .map(r => r.reference
+            .replace(/<.*?>/g, "") // Remove HTML tags
+            .replace(/\s+/g, " ") // Collapse multiple spaces/newlines
+            .trim()
+          )
+          .join("\n"); // One per line
 
         const htmlText = cleanResults
-          .map(r => `<div>${r.reference}</div>`)
-          .join("<br>");
+          .map(r => `<div>${r.reference.replace(/\s+/g, " ").trim()}</div>`)
+          .join("");
 
         try {
             const clipboardItem = new (window as any).ClipboardItem({
@@ -290,7 +311,6 @@ export default class ZoteroABNTPlugin extends Plugin {
       }
     });
 
-    // SMART LINK: Markdown Post Processor for Reading Mode
     this.registerMarkdownPostProcessor((el, ctx) => {
         const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
         const nodesToReplace: { textNode: Text, span: HTMLElement }[] = [];
@@ -298,9 +318,9 @@ export default class ZoteroABNTPlugin extends Plugin {
         let node;
         while (node = walker.nextNode()) {
             const text = node.textContent;
-            if (text && /@([\w:_-]+)/.test(text)) {
+            if (text && /\[@([\w:_-]+)\]/.test(text)) {
                 const span = document.createElement("span");
-                span.innerHTML = text.replace(/@([\w:_-]+)/g, (match, citekey) => {
+                span.innerHTML = text.replace(/\[@([\w:_-]+)\]/g, (match, citekey) => {
                     return `<span class="abnt-citekey-link" data-citekey="${citekey}" style="color: var(--text-accent); cursor: pointer; text-decoration: underline;">${match}</span>`;
                 });
                 nodesToReplace.push({ textNode: node as Text, span });
@@ -320,34 +340,24 @@ export default class ZoteroABNTPlugin extends Plugin {
         });
     });
 
-    // SMART LINK: Editor Click Handler (Alt + Click)
     this.registerDomEvent(document, "click", (evt: MouseEvent) => {
         if (!evt.altKey) return;
+        const target = evt.target as HTMLElement;
+        if (!target.closest(".markdown-source-view, .markdown-reading-view")) return;
         
-        // This logic is a bit broad, but helps catch Alt+Click on text
         const selection = window.getSelection()?.toString().trim();
-        // Match @citekey or just citekey if the user selects without @
         if (selection) {
             const cleanKey = selection.startsWith("@") ? selection.substring(1) : selection;
-            // Only attempt if it looks like a citekey (alphanumeric/colons)
             if (/^[\w:_-]+$/.test(cleanKey)) {
                 this.openCitekeyFile(cleanKey);
             }
         }
     }, true);
 
-    this.debouncedUpdate = debounce(
-      () => this.updateReferences(),
-      1000,
-      true
-    );
+    this.debouncedUpdate = debounce(() => this.updateReferences(), 1500, true);
 
-    this.registerEvent(
-      this.app.workspace.on("file-open", () => this.updateReferences())
-    );
-    this.registerEvent(
-      this.app.workspace.on("editor-change", () => this.debouncedUpdate())
-    );
+    this.registerEvent(this.app.workspace.on("file-open", () => this.updateReferences()));
+    this.registerEvent(this.app.workspace.on("editor-change", () => this.debouncedUpdate()));
 
     this.app.workspace.onLayoutReady(async () => {
       await this.updateReferences();
@@ -355,25 +365,19 @@ export default class ZoteroABNTPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    this.referenceCache.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_ABNT);
   }
 
   private async openCitekeyFile(citekey: string) {
     const files = this.app.vault.getMarkdownFiles();
-    console.log(`[ABNT] Searching for citekey: ${citekey}`);
-    
     for (const file of files) {
         const cache = this.app.metadataCache.getFileCache(file);
         const fileCitekey = cache?.frontmatter?.citekey;
-        
         if (fileCitekey) {
             const keys = Array.isArray(fileCitekey) ? fileCitekey.map(String) : [String(fileCitekey)];
-            // Sanitize frontmatter keys: remove [@...], brackets, quotes
             const cleanKeys = keys.map(k => k.replace(/[\[\]"@]/g, "").trim());
-            
             if (cleanKeys.includes(citekey)) {
-                console.log(`[ABNT] Found matching file: ${file.path}`);
-                // Open in a new tab (leaf)
                 await this.app.workspace.getLeaf("tab").openFile(file);
                 return;
             }
@@ -395,7 +399,10 @@ export default class ZoteroABNTPlugin extends Plugin {
     let leaf = workspace.getLeavesOfType(VIEW_TYPE_ABNT)[0];
     if (!leaf) {
       const newLeaf = workspace.getRightLeaf(false);
-      if (!newLeaf) return;
+      if (!newLeaf) {
+          new Notice("Não foi possível abrir a barra lateral. Verifique se o painel direito está disponível.");
+          return;
+      }
       await newLeaf.setViewState({ type: VIEW_TYPE_ABNT, active: true });
       leaf = newLeaf;
     }
@@ -423,34 +430,19 @@ export default class ZoteroABNTPlugin extends Plugin {
     view.setLoading();
 
     try {
-      const rawResponse = await bbtRequest(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "item.bibliography",
-          params: [citekeys, { id: ABNT_STYLE_ID, contentType: "html" }]
-        })
-      );
-
-      const data = JSON.parse(rawResponse);
-
-      if (data.error) {
-        const results = await Promise.all(citekeys.map(key => this.fetchSingleReference(key)));
-        view.setResults(results);
-        return;
-      }
-
       const results = await Promise.all(citekeys.map(key => this.fetchSingleReference(key)));
       view.setResults(results);
-
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e);
-      console.error("[ABNT] Connection failed:", e);
-      view.setError(`Falha na conexão: ${errorMsg}`);
+      view.setError(errorMsg);
     }
   }
 
   private async fetchSingleReference(citekey: string): Promise<ReferenceResult> {
+    if (this.referenceCache.has(citekey)) {
+        return this.referenceCache.get(citekey)!;
+    }
+
     try {
       const rawResponse = await bbtRequest(
         JSON.stringify({
@@ -465,7 +457,10 @@ export default class ZoteroABNTPlugin extends Plugin {
       if (data.error) {
         return { citekey, reference: "", error: data.error.message };
       }
-      return { citekey, reference: (data.result || "").trim(), error: undefined };
+      
+      const result = { citekey, reference: (data.result || "").trim(), error: undefined };
+      this.referenceCache.set(citekey, result);
+      return result;
     } catch (e) {
       return { citekey, reference: "", error: "Erro de conexão" };
     }

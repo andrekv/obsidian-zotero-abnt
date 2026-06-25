@@ -3,3 +3,10 @@ main.js
 .DS_Store
 .makemd
 .obsidian
+
+
+# Failed attempts & Graveyard code (local only)
+**/FAILED_ATTEMPTS.md
+**/graveyard/
+
+**/CONTEXT.md

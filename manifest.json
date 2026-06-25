@@ -1,7 +1,7 @@
 {
 	"id": "obsidian-zotero-abnt",
 	"name": "Zotero ABNT References",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"minAppVersion": "1.0.0",
 	"description": "Sidebar for ABNT (NBR 6023) references from Zotero, with citekey autocomplete and smart navigation.",
 	"author": "andrekv",
