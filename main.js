@@ -246,6 +246,7 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
   async onload() {
     this.registerView(VIEW_TYPE_ABNT, (leaf) => new ABNTView(leaf));
     this.registerEditorSuggest(new CitekeySuggest(this.app, this));
+    this.injectStyles();
     this.addRibbonIcon("book-open", "Refer\xEAncias ABNT (Zotero)", () => {
       this.activateView();
     });
@@ -338,6 +339,9 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
   async onunload() {
     this.referenceCache.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_ABNT);
+    const styleEl = document.getElementById("abnt-references-styles");
+    if (styleEl)
+      styleEl.remove();
   }
   async openCitekeyFile(citekey) {
     var _a;
@@ -378,6 +382,7 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
     workspace.revealLeaf(leaf);
   }
   async updateReferences() {
+    var _a, _b;
     const view = this.getView();
     if (!view)
       return;
@@ -387,19 +392,72 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
       return;
     }
     const content = await this.app.vault.read(file);
-    const citekeys = this.extractCitekeys(content);
-    if (citekeys.length === 0) {
+    const inlineKeys = this.extractCitekeys(content);
+    let frontmatterKeys = [];
+    const cache = this.app.metadataCache.getFileCache(file);
+    const fileCitekey = (_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.citekey;
+    if (fileCitekey) {
+      const keys = Array.isArray(fileCitekey) ? fileCitekey.map(String) : [String(fileCitekey)];
+      frontmatterKeys = keys.map((k) => k.replace(/[\[\]"@]/g, "").trim());
+    }
+    const linkedKeys = [];
+    const links = (cache == null ? void 0 : cache.links) || [];
+    const embeds = (cache == null ? void 0 : cache.embeds) || [];
+    const allLinks = [...links, ...embeds];
+    const resolvedPaths = /* @__PURE__ */ new Set();
+    for (const target of allLinks) {
+      const destFile = this.app.metadataCache.getFirstLinkpathDest(target.link, file.path);
+      if (destFile && destFile.extension === "md" && !resolvedPaths.has(destFile.path)) {
+        resolvedPaths.add(destFile.path);
+        const destCache = this.app.metadataCache.getFileCache(destFile);
+        const destCitekey = (_b = destCache == null ? void 0 : destCache.frontmatter) == null ? void 0 : _b.citekey;
+        if (destCitekey) {
+          const keys = Array.isArray(destCitekey) ? destCitekey.map(String) : [String(destCitekey)];
+          keys.forEach((k) => {
+            linkedKeys.push(k.replace(/[\[\]"@]/g, "").trim());
+          });
+        }
+      }
+    }
+    const allKeys = [.../* @__PURE__ */ new Set([...inlineKeys, ...frontmatterKeys, ...linkedKeys])];
+    if (allKeys.length === 0) {
       view.setResults([]);
+      document.querySelectorAll('.metadata-property[data-property-key="citekey"]').forEach((el) => {
+        el.classList.remove("abnt-property-matched", "abnt-property-error");
+      });
       return;
     }
     view.setLoading();
     try {
-      const results = await Promise.all(citekeys.map((key) => this.fetchSingleReference(key)));
+      const results = await Promise.all(allKeys.map((key) => this.fetchSingleReference(key)));
       view.setResults(results);
+      document.querySelectorAll(".abnt-citekey-link").forEach((link) => {
+        link.style.color = "var(--text-accent)";
+      });
+      document.querySelectorAll('.metadata-property[data-property-key="citekey"]').forEach((propertyEl) => {
+        propertyEl.classList.remove("abnt-property-matched", "abnt-property-error");
+      });
+      this.app.workspace.iterateAllLeaves((leaf) => {
+        if (leaf.view instanceof import_obsidian.MarkdownView) {
+          const editor = leaf.view.editor;
+          if (editor && editor.cm) {
+            editor.cm.dispatch({});
+          }
+        }
+      });
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e);
       view.setError(errorMsg);
     }
+  }
+  injectStyles() {
+    let styleEl = document.getElementById("abnt-references-styles");
+    if (!styleEl) {
+      styleEl = document.createElement("style");
+      styleEl.id = "abnt-references-styles";
+      document.head.appendChild(styleEl);
+    }
+    styleEl.textContent = ``;
   }
   async fetchSingleReference(citekey) {
     if (this.referenceCache.has(citekey)) {

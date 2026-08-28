@@ -257,6 +257,7 @@ export default class ZoteroABNTPlugin extends Plugin {
   async onload(): Promise<void> {
     this.registerView(VIEW_TYPE_ABNT, (leaf) => new ABNTView(leaf));
     this.registerEditorSuggest(new CitekeySuggest(this.app, this));
+    this.injectStyles();
 
     this.addRibbonIcon("book-open", "Referências ABNT (Zotero)", () => {
       this.activateView();
@@ -367,6 +368,8 @@ export default class ZoteroABNTPlugin extends Plugin {
   async onunload(): Promise<void> {
     this.referenceCache.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_ABNT);
+    const styleEl = document.getElementById("abnt-references-styles");
+    if (styleEl) styleEl.remove();
   }
 
   private async openCitekeyFile(citekey: string) {
@@ -420,22 +423,85 @@ export default class ZoteroABNTPlugin extends Plugin {
     }
 
     const content = await this.app.vault.read(file);
-    const citekeys = this.extractCitekeys(content);
+    const inlineKeys = this.extractCitekeys(content);
+    
+    // Extract frontmatter citekeys
+    let frontmatterKeys: string[] = [];
+    const cache = this.app.metadataCache.getFileCache(file);
+    const fileCitekey = cache?.frontmatter?.citekey;
+    if (fileCitekey) {
+      const keys = Array.isArray(fileCitekey) ? fileCitekey.map(String) : [String(fileCitekey)];
+      frontmatterKeys = keys.map(k => k.replace(/[\[\]"@]/g, "").trim());
+    }
 
-    if (citekeys.length === 0) {
+    // Extract citekeys from linked/embedded notes
+    const linkedKeys: string[] = [];
+    const links = cache?.links || [];
+    const embeds = cache?.embeds || [];
+    const allLinks = [...links, ...embeds];
+    const resolvedPaths = new Set<string>();
+
+    for (const target of allLinks) {
+      const destFile = this.app.metadataCache.getFirstLinkpathDest(target.link, file.path);
+      if (destFile && destFile.extension === "md" && !resolvedPaths.has(destFile.path)) {
+        resolvedPaths.add(destFile.path);
+        const destCache = this.app.metadataCache.getFileCache(destFile);
+        const destCitekey = destCache?.frontmatter?.citekey;
+        if (destCitekey) {
+          const keys = Array.isArray(destCitekey) ? destCitekey.map(String) : [String(destCitekey)];
+          keys.forEach(k => {
+            linkedKeys.push(k.replace(/[\[\]"@]/g, "").trim());
+          });
+        }
+      }
+    }
+
+    const allKeys = [...new Set([...inlineKeys, ...frontmatterKeys, ...linkedKeys])];
+
+    if (allKeys.length === 0) {
       view.setResults([]);
+      document.querySelectorAll('.metadata-property[data-property-key="citekey"]').forEach((el) => {
+        el.classList.remove("abnt-property-matched", "abnt-property-error");
+      });
       return;
     }
 
     view.setLoading();
 
     try {
-      const results = await Promise.all(citekeys.map(key => this.fetchSingleReference(key)));
+      const results = await Promise.all(allKeys.map(key => this.fetchSingleReference(key)));
       view.setResults(results);
+
+      document.querySelectorAll(".abnt-citekey-link").forEach((link) => {
+        (link as HTMLElement).style.color = "var(--text-accent)";
+      });
+
+      document.querySelectorAll('.metadata-property[data-property-key="citekey"]').forEach((propertyEl) => {
+        propertyEl.classList.remove("abnt-property-matched", "abnt-property-error");
+      });
+
+      this.app.workspace.iterateAllLeaves((leaf) => {
+        if (leaf.view instanceof MarkdownView) {
+          const editor = (leaf.view as any).editor;
+          if (editor && editor.cm) {
+            editor.cm.dispatch({});
+          }
+        }
+      });
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e);
       view.setError(errorMsg);
     }
+  }
+
+  private injectStyles(): void {
+    let styleEl = document.getElementById("abnt-references-styles");
+    if (!styleEl) {
+      styleEl = document.createElement("style");
+      styleEl.id = "abnt-references-styles";
+      document.head.appendChild(styleEl);
+    }
+    styleEl.textContent = ``;
   }
 
   private async fetchSingleReference(citekey: string): Promise<ReferenceResult> {
