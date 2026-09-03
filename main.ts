@@ -1,4 +1,4 @@
-import { App, ItemView, Plugin, WorkspaceLeaf, debounce, Notice, MarkdownView, Editor, EditorSuggest, EditorSuggestContext, EditorPosition, EditorSuggestTriggerInfo, TFile } from "obsidian";
+import { App, ItemView, Plugin, WorkspaceLeaf, debounce, Notice, MarkdownView, Editor, EditorSuggest, EditorSuggestContext, EditorPosition, EditorSuggestTriggerInfo, TFile, PluginSettingTab, Setting, requestUrl } from "obsidian";
 import * as http from "http";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -18,6 +18,18 @@ interface ReferenceResult {
   error?: string;
 }
 
+interface ZoteroABNTSettings {
+  zoteroUserId: string;
+  zoteroApiKey: string;
+  referenceCache: Record<string, ReferenceResult>;
+}
+
+const DEFAULT_SETTINGS: ZoteroABNTSettings = {
+  zoteroUserId: "",
+  zoteroApiKey: "",
+  referenceCache: {},
+};
+
 // ─── Utility: Node.js HTTP Request ───────────────────────────────────────────
 
 function bbtRequest(body: string): Promise<string> {
@@ -34,6 +46,7 @@ function bbtRequest(body: string): Promise<string> {
           "Content-Type": "application/json",
           "Content-Length": bodyBuffer.length,
         },
+        timeout: 1000,
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -43,6 +56,10 @@ function bbtRequest(body: string): Promise<string> {
       }
     );
 
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Timeout conectando ao Zotero local"));
+    });
     req.on("error", reject);
     req.write(bodyBuffer);
     req.end();
@@ -248,13 +265,76 @@ class CitekeySuggest extends EditorSuggest<string> {
   }
 }
 
+// ─── Settings Tab ─────────────────────────────────────────────────────────────
+
+class ZoteroABNTSettingTab extends PluginSettingTab {
+  plugin: ZoteroABNTPlugin;
+
+  constructor(app: App, plugin: ZoteroABNTPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl("h2", { text: "Zotero ABNT References" });
+
+    new Setting(containerEl)
+      .setName("Zotero User ID")
+      .setDesc("Seu User ID do Zotero (encontrado em zotero.org/settings/keys). Permite buscar referências sem precisar abrir o aplicativo do Zotero.")
+      .addText((text) =>
+        text
+          .setPlaceholder("Ex: 1234567")
+          .setValue(this.plugin.settings.zoteroUserId || "")
+          .onChange(async (value) => {
+            this.plugin.settings.zoteroUserId = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Zotero API Key")
+      .setDesc("Sua chave privada da API do Zotero com permissão de leitura.")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text
+          .setPlaceholder("Chave da API")
+          .setValue(this.plugin.settings.zoteroApiKey || "")
+          .onChange(async (value) => {
+            this.plugin.settings.zoteroApiKey = value.trim();
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Limpar Cache Local")
+      .setDesc("Apaga as referências salvas localmente para forçar uma nova atualização.")
+      .addButton((button) =>
+        button
+          .setButtonText("Limpar Cache")
+          .setWarning()
+          .onClick(async () => {
+            this.plugin.settings.referenceCache = {};
+            this.plugin.referenceCache.clear();
+            await this.plugin.saveSettings();
+            new Notice("Cache de referências limpo com sucesso!");
+            this.plugin.updateReferences();
+          })
+      );
+  }
+}
+
 // ─── Main Plugin ──────────────────────────────────────────────────────────────
 
 export default class ZoteroABNTPlugin extends Plugin {
+  settings!: ZoteroABNTSettings;
   private debouncedUpdate!: () => void;
-  private referenceCache: Map<string, ReferenceResult> = new Map();
+  referenceCache: Map<string, ReferenceResult> = new Map();
 
   async onload(): Promise<void> {
+    await this.loadSettings();
+    this.addSettingTab(new ZoteroABNTSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_ABNT, (leaf) => new ABNTView(leaf));
     this.registerEditorSuggest(new CitekeySuggest(this.app, this));
     this.injectStyles();
@@ -504,11 +584,35 @@ export default class ZoteroABNTPlugin extends Plugin {
     styleEl.textContent = ``;
   }
 
+  async loadSettings(): Promise<void> {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (this.settings.referenceCache) {
+      for (const [k, v] of Object.entries(this.settings.referenceCache)) {
+        this.referenceCache.set(k, v);
+      }
+    }
+  }
+
+  async saveSettings(): Promise<void> {
+    const cacheObj: Record<string, ReferenceResult> = {};
+    for (const [k, v] of this.referenceCache.entries()) {
+      if (v && !v.error) {
+        cacheObj[k] = v;
+      }
+    }
+    this.settings.referenceCache = cacheObj;
+    await this.saveData(this.settings);
+  }
+
   private async fetchSingleReference(citekey: string): Promise<ReferenceResult> {
     if (this.referenceCache.has(citekey)) {
-        return this.referenceCache.get(citekey)!;
+      const cached = this.referenceCache.get(citekey);
+      if (cached && !cached.error) {
+        return cached;
+      }
     }
 
+    // 1. Tenta Better BibTeX local primeiro (caso Zotero esteja aberto)
     try {
       const rawResponse = await bbtRequest(
         JSON.stringify({
@@ -520,16 +624,127 @@ export default class ZoteroABNTPlugin extends Plugin {
       );
 
       const data = JSON.parse(rawResponse);
-      if (data.error) {
-        return { citekey, reference: "", error: data.error.message };
+      if (!data.error && data.result) {
+        const result: ReferenceResult = { citekey, reference: (data.result || "").trim(), error: undefined };
+        this.referenceCache.set(citekey, result);
+        await this.saveSettings();
+        return result;
       }
-      
-      const result = { citekey, reference: (data.result || "").trim(), error: undefined };
-      this.referenceCache.set(citekey, result);
-      return result;
-    } catch (e) {
-      return { citekey, reference: "", error: "Erro de conexão" };
+    } catch (localErr) {
+      // Zotero local fechado ou erro de conexão; prossegue para Web API
     }
+
+    // 2. Fallback para Zotero Web API se credenciais estiverem configuradas
+    const { zoteroUserId, zoteroApiKey } = this.settings || {};
+    if (zoteroUserId && zoteroApiKey) {
+      if (!/^\d+$/.test(zoteroUserId.trim())) {
+        return { citekey, reference: "", error: "User ID inválido (deve ser numérico, ex: 1234567, não o nome da chave)" };
+      }
+      const queries = this.buildSearchQueries(citekey);
+      let lastError: any = null;
+      for (const query of queries) {
+        try {
+          const url = `https://api.zotero.org/users/${encodeURIComponent(zoteroUserId.trim())}/items?q=${encodeURIComponent(query)}&include=bib,data&style=${ABNT_STYLE_ID}&limit=25`;
+          const response = await requestUrl({
+            url,
+            headers: {
+              "Zotero-API-Version": "3",
+              "Zotero-API-Key": zoteroApiKey.trim()
+            }
+          });
+          const items = response.json || (response.text ? JSON.parse(response.text) : []);
+          if (Array.isArray(items) && items.length > 0) {
+            const lowerKey = citekey.toLowerCase();
+            let matchedItem = items.find((it: any) => {
+              const ck = it.data?.citationKey || "";
+              const extra = it.data?.extra || "";
+              return ck.toLowerCase() === lowerKey || extra.toLowerCase().includes(lowerKey);
+            });
+            if (!matchedItem && items.length === 1) {
+              matchedItem = items[0];
+            }
+            if (matchedItem && matchedItem.bib) {
+              const result: ReferenceResult = { citekey, reference: matchedItem.bib.trim(), error: undefined };
+              this.referenceCache.set(citekey, result);
+              await this.saveSettings();
+              return result;
+            }
+          }
+        } catch (webErr) {
+          lastError = webErr;
+        }
+      }
+      if (lastError) {
+        const status = lastError?.status || "";
+        const detail = lastError?.message || "";
+        return { citekey, reference: "", error: `Erro na Zotero Web API (${status} ${detail})`.trim() };
+      }
+      return { citekey, reference: "", error: "Item não encontrado no Zotero Web" };
+    }
+
+    return { citekey, reference: "", error: "Zotero fechado (configure User ID e API Key nas opções)" };
+  }
+
+  private buildSearchQueries(citekey: string): string[] {
+    const queries: string[] = [];
+    const yearMatch = citekey.match(/\b(18|19|20)\d{2}[a-z]?\b/i) || citekey.match(/\d{4}/);
+    const year = yearMatch ? yearMatch[0].replace(/[a-z]$/i, "") : "";
+
+    const words = citekey
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+      .replace(/([a-zA-Z])(\d+)/g, "$1 $2")
+      .replace(/(\d+)([a-zA-Z])/g, "$1 $2")
+      .replace(/[-_:]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean);
+
+    const author = words.length > 0 ? words[0] : "";
+    const titleWords = words.slice(1).filter((w) => w !== year);
+
+    // 1. Palavras do título + ano (ex: "Models Examples 2019" - resolve sobrenomes compostos como Viveiros de Castro)
+    if (titleWords.length > 0 && year) {
+      queries.push(`${titleWords.slice(0, 3).join(" ")} ${year}`);
+    }
+
+    // 2. Autor com preposições separadas (ex: "viveirosdecastro" -> "viveiros de castro 2019")
+    let expandedAuthor = author
+      .replace(/^(de|da|do|dos|das|van|von|der|del)([a-z]+)/i, "$1 $2")
+      .replace(/(de|da|do|dos|das|van|von|der|del)([a-z]+)$/i, " $1 $2");
+    if (expandedAuthor !== author && year) {
+      queries.push(`${expandedAuthor} ${year}`);
+    }
+
+    // 3. Autor + Ano (ex: "judd 2005", "freud 2021")
+    if (author && year) {
+      queries.push(`${author} ${year}`);
+    }
+
+    // 4. Título do arquivo de nota no cofre se existir
+    try {
+      const lower = citekey.toLowerCase();
+      const files = this.app.vault.getMarkdownFiles();
+      for (const file of files) {
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fc = cache?.frontmatter?.citekey;
+        if (fc && String(fc).replace(/[\[\]"@]/g, "").trim().toLowerCase() === lower) {
+          const t = file.basename.replace(/^[a-z0-9_]+[0-9]{4}\s*/i, "").trim();
+          if (t && year) queries.push(`${t} ${year}`);
+          else if (t) queries.push(t);
+          break;
+        }
+      }
+    } catch (ignore) {}
+
+    // 5. Todas as palavras
+    if (words.length > 1) {
+      queries.push(words.join(" "));
+    }
+
+    // 6. Citekey original
+    queries.push(citekey);
+
+    return [...new Set(queries)];
   }
 
   private extractCitekeys(content: string): string[] {

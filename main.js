@@ -40,6 +40,11 @@ var BBT_HOSTNAME = "127.0.0.1";
 var BBT_PORT = 23119;
 var BBT_PATH = "/better-bibtex/json-rpc";
 var ABNT_STYLE_ID = "associacao-brasileira-de-normas-tecnicas";
+var DEFAULT_SETTINGS = {
+  zoteroUserId: "",
+  zoteroApiKey: "",
+  referenceCache: {}
+};
 function bbtRequest(body) {
   return new Promise((resolve, reject) => {
     const bodyBuffer = Buffer.from(body, "utf-8");
@@ -52,7 +57,8 @@ function bbtRequest(body) {
         headers: {
           "Content-Type": "application/json",
           "Content-Length": bodyBuffer.length
-        }
+        },
+        timeout: 1e3
       },
       (res) => {
         const chunks = [];
@@ -61,6 +67,10 @@ function bbtRequest(body) {
         res.on("error", reject);
       }
     );
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Timeout conectando ao Zotero local"));
+    });
     req.on("error", reject);
     req.write(bodyBuffer);
     req.end();
@@ -238,12 +248,47 @@ var CitekeySuggest = class extends import_obsidian.EditorSuggest {
     }
   }
 };
+var ZoteroABNTSettingTab = class extends import_obsidian.PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl("h2", { text: "Zotero ABNT References" });
+    new import_obsidian.Setting(containerEl).setName("Zotero User ID").setDesc("Seu User ID do Zotero (encontrado em zotero.org/settings/keys). Permite buscar refer\xEAncias sem precisar abrir o aplicativo do Zotero.").addText(
+      (text) => text.setPlaceholder("Ex: 1234567").setValue(this.plugin.settings.zoteroUserId || "").onChange(async (value) => {
+        this.plugin.settings.zoteroUserId = value.trim();
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Zotero API Key").setDesc("Sua chave privada da API do Zotero com permiss\xE3o de leitura.").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("Chave da API").setValue(this.plugin.settings.zoteroApiKey || "").onChange(async (value) => {
+        this.plugin.settings.zoteroApiKey = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+    new import_obsidian.Setting(containerEl).setName("Limpar Cache Local").setDesc("Apaga as refer\xEAncias salvas localmente para for\xE7ar uma nova atualiza\xE7\xE3o.").addButton(
+      (button) => button.setButtonText("Limpar Cache").setWarning().onClick(async () => {
+        this.plugin.settings.referenceCache = {};
+        this.plugin.referenceCache.clear();
+        await this.plugin.saveSettings();
+        new import_obsidian.Notice("Cache de refer\xEAncias limpo com sucesso!");
+        this.plugin.updateReferences();
+      })
+    );
+  }
+};
 var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.referenceCache = /* @__PURE__ */ new Map();
   }
   async onload() {
+    await this.loadSettings();
+    this.addSettingTab(new ZoteroABNTSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_ABNT, (leaf) => new ABNTView(leaf));
     this.registerEditorSuggest(new CitekeySuggest(this.app, this));
     this.injectStyles();
@@ -459,9 +504,30 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
     }
     styleEl.textContent = ``;
   }
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (this.settings.referenceCache) {
+      for (const [k, v] of Object.entries(this.settings.referenceCache)) {
+        this.referenceCache.set(k, v);
+      }
+    }
+  }
+  async saveSettings() {
+    const cacheObj = {};
+    for (const [k, v] of this.referenceCache.entries()) {
+      if (v && !v.error) {
+        cacheObj[k] = v;
+      }
+    }
+    this.settings.referenceCache = cacheObj;
+    await this.saveData(this.settings);
+  }
   async fetchSingleReference(citekey) {
     if (this.referenceCache.has(citekey)) {
-      return this.referenceCache.get(citekey);
+      const cached = this.referenceCache.get(citekey);
+      if (cached && !cached.error) {
+        return cached;
+      }
     }
     try {
       const rawResponse = await bbtRequest(
@@ -473,15 +539,103 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
         })
       );
       const data = JSON.parse(rawResponse);
-      if (data.error) {
-        return { citekey, reference: "", error: data.error.message };
+      if (!data.error && data.result) {
+        const result = { citekey, reference: (data.result || "").trim(), error: void 0 };
+        this.referenceCache.set(citekey, result);
+        await this.saveSettings();
+        return result;
       }
-      const result = { citekey, reference: (data.result || "").trim(), error: void 0 };
-      this.referenceCache.set(citekey, result);
-      return result;
-    } catch (e) {
-      return { citekey, reference: "", error: "Erro de conex\xE3o" };
+    } catch (localErr) {
     }
+    const { zoteroUserId, zoteroApiKey } = this.settings || {};
+    if (zoteroUserId && zoteroApiKey) {
+      if (!/^\d+$/.test(zoteroUserId.trim())) {
+        return { citekey, reference: "", error: "User ID inv\xE1lido (deve ser num\xE9rico, ex: 1234567, n\xE3o o nome da chave)" };
+      }
+      const queries = this.buildSearchQueries(citekey);
+      let lastError = null;
+      for (const query of queries) {
+        try {
+          const url = `https://api.zotero.org/users/${encodeURIComponent(zoteroUserId.trim())}/items?q=${encodeURIComponent(query)}&include=bib,data&style=${ABNT_STYLE_ID}&limit=25`;
+          const response = await (0, import_obsidian.requestUrl)({
+            url,
+            headers: {
+              "Zotero-API-Version": "3",
+              "Zotero-API-Key": zoteroApiKey.trim()
+            }
+          });
+          const items = response.json || (response.text ? JSON.parse(response.text) : []);
+          if (Array.isArray(items) && items.length > 0) {
+            const lowerKey = citekey.toLowerCase();
+            let matchedItem = items.find((it) => {
+              var _a, _b;
+              const ck = ((_a = it.data) == null ? void 0 : _a.citationKey) || "";
+              const extra = ((_b = it.data) == null ? void 0 : _b.extra) || "";
+              return ck.toLowerCase() === lowerKey || extra.toLowerCase().includes(lowerKey);
+            });
+            if (!matchedItem && items.length === 1) {
+              matchedItem = items[0];
+            }
+            if (matchedItem && matchedItem.bib) {
+              const result = { citekey, reference: matchedItem.bib.trim(), error: void 0 };
+              this.referenceCache.set(citekey, result);
+              await this.saveSettings();
+              return result;
+            }
+          }
+        } catch (webErr) {
+          lastError = webErr;
+        }
+      }
+      if (lastError) {
+        const status = (lastError == null ? void 0 : lastError.status) || "";
+        const detail = (lastError == null ? void 0 : lastError.message) || "";
+        return { citekey, reference: "", error: `Erro na Zotero Web API (${status} ${detail})`.trim() };
+      }
+      return { citekey, reference: "", error: "Item n\xE3o encontrado no Zotero Web" };
+    }
+    return { citekey, reference: "", error: "Zotero fechado (configure User ID e API Key nas op\xE7\xF5es)" };
+  }
+  buildSearchQueries(citekey) {
+    var _a;
+    const queries = [];
+    const yearMatch = citekey.match(/\b(18|19|20)\d{2}[a-z]?\b/i) || citekey.match(/\d{4}/);
+    const year = yearMatch ? yearMatch[0].replace(/[a-z]$/i, "") : "";
+    const words = citekey.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([a-zA-Z])(\d+)/g, "$1 $2").replace(/(\d+)([a-zA-Z])/g, "$1 $2").replace(/[-_:]/g, " ").split(/\s+/).filter(Boolean);
+    const author = words.length > 0 ? words[0] : "";
+    const titleWords = words.slice(1).filter((w) => w !== year);
+    if (titleWords.length > 0 && year) {
+      queries.push(`${titleWords.slice(0, 3).join(" ")} ${year}`);
+    }
+    let expandedAuthor = author.replace(/^(de|da|do|dos|das|van|von|der|del)([a-z]+)/i, "$1 $2").replace(/(de|da|do|dos|das|van|von|der|del)([a-z]+)$/i, " $1 $2");
+    if (expandedAuthor !== author && year) {
+      queries.push(`${expandedAuthor} ${year}`);
+    }
+    if (author && year) {
+      queries.push(`${author} ${year}`);
+    }
+    try {
+      const lower = citekey.toLowerCase();
+      const files = this.app.vault.getMarkdownFiles();
+      for (const file of files) {
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fc = (_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.citekey;
+        if (fc && String(fc).replace(/[\[\]"@]/g, "").trim().toLowerCase() === lower) {
+          const t = file.basename.replace(/^[a-z0-9_]+[0-9]{4}\s*/i, "").trim();
+          if (t && year)
+            queries.push(`${t} ${year}`);
+          else if (t)
+            queries.push(t);
+          break;
+        }
+      }
+    } catch (ignore) {
+    }
+    if (words.length > 1) {
+      queries.push(words.join(" "));
+    }
+    queries.push(citekey);
+    return [...new Set(queries)];
   }
   extractCitekeys(content) {
     const matches = [...content.matchAll(CITEKEY_REGEX)];
