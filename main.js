@@ -76,6 +76,11 @@ function bbtRequest(body) {
     req.end();
   });
 }
+function htmlToPlainText(html) {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  return (div.textContent || "").replace(/\s+/g, " ").trim();
+}
 var ABNTView = class extends import_obsidian.ItemView {
   constructor(leaf) {
     super(leaf);
@@ -148,8 +153,8 @@ var ABNTView = class extends import_obsidian.ItemView {
         item.addEventListener("contextmenu", async (e) => {
           e.preventDefault();
           const rawRef = res.reference;
-          const plainText = rawRef.replace(/<.*?>/g, "").replace(/\s+/g, " ").trim();
-          const htmlText = `<div>${rawRef.replace(/\s+/g, " ").trim()}</div>`;
+          const plainText = `[${index + 1}] ` + htmlToPlainText(rawRef);
+          const htmlText = `<div>[${index + 1}] ${rawRef.replace(/\s+/g, " ").trim()}</div>`;
           try {
             const clipboardItem = new window.ClipboardItem({
               "text/plain": new Blob([plainText], { type: "text/plain" }),
@@ -291,7 +296,6 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
     this.addSettingTab(new ZoteroABNTSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_ABNT, (leaf) => new ABNTView(leaf));
     this.registerEditorSuggest(new CitekeySuggest(this.app, this));
-    this.injectStyles();
     this.addRibbonIcon("book-open", "Refer\xEAncias ABNT (Zotero)", () => {
       this.activateView();
     });
@@ -303,7 +307,12 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
     this.addCommand({
       id: "refresh-abnt-references",
       name: "Refresh references",
-      callback: () => this.updateReferences()
+      callback: () => {
+        for (const [k, v] of this.referenceCache)
+          if (v.error)
+            this.referenceCache.delete(k);
+        this.updateReferences();
+      }
     });
     this.addCommand({
       id: "copy-abnt-references",
@@ -314,11 +323,9 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
           new import_obsidian.Notice("Nenhuma refer\xEAncia para copiar.");
           return;
         }
-        const cleanResults = view.results.filter((r) => !r.error);
-        const plainText = cleanResults.map(
-          (r) => r.reference.replace(/<.*?>/g, "").replace(/\s+/g, " ").trim()
-        ).join("\n");
-        const htmlText = cleanResults.map((r) => `<div>${r.reference.replace(/\s+/g, " ").trim()}</div>`).join("");
+        const cleanResults = view.results.map((r, i) => ({ r, i })).filter(({ r }) => !r.error);
+        const plainText = cleanResults.map(({ r, i }) => `[${i + 1}] ` + htmlToPlainText(r.reference)).join("\n");
+        const htmlText = cleanResults.map(({ r, i }) => `<div>[${i + 1}] ${r.reference.replace(/\s+/g, " ").trim()}</div>`).join("");
         try {
           const clipboardItem = new window.ClipboardItem({
             "text/plain": new Blob([plainText], { type: "text/plain" }),
@@ -340,9 +347,15 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
         const text = node.textContent;
         if (text && /\[@([\w:_-]+)\]/.test(text)) {
           const span = document.createElement("span");
-          span.innerHTML = text.replace(/\[@([\w:_-]+)\]/g, (match, citekey) => {
-            return `<span class="abnt-citekey-link" data-citekey="${citekey}" style="color: var(--text-accent); cursor: pointer; text-decoration: underline;">${match}</span>`;
-          });
+          let last = 0;
+          for (const m of text.matchAll(/\[@([\w:_-]+)\]/g)) {
+            span.append(text.slice(last, m.index));
+            const link = span.createSpan({ cls: "abnt-citekey-link", text: m[0] });
+            link.dataset.citekey = m[1];
+            link.style.cssText = "color: var(--text-accent); cursor: pointer; text-decoration: underline;";
+            last = m.index + m[0].length;
+          }
+          span.append(text.slice(last));
           nodesToReplace.push({ textNode: node, span });
         }
       }
@@ -384,9 +397,6 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
   async onunload() {
     this.referenceCache.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_ABNT);
-    const styleEl = document.getElementById("abnt-references-styles");
-    if (styleEl)
-      styleEl.remove();
   }
   async openCitekeyFile(citekey) {
     var _a;
@@ -474,7 +484,10 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
     }
     view.setLoading();
     try {
+      const before = this.referenceCache.size;
       const results = await Promise.all(allKeys.map((key) => this.fetchSingleReference(key)));
+      if (this.referenceCache.size !== before)
+        await this.saveSettings();
       view.setResults(results);
       document.querySelectorAll(".abnt-citekey-link").forEach((link) => {
         link.style.color = "var(--text-accent)";
@@ -482,27 +495,10 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
       document.querySelectorAll('.metadata-property[data-property-key="citekey"]').forEach((propertyEl) => {
         propertyEl.classList.remove("abnt-property-matched", "abnt-property-error");
       });
-      this.app.workspace.iterateAllLeaves((leaf) => {
-        if (leaf.view instanceof import_obsidian.MarkdownView) {
-          const editor = leaf.view.editor;
-          if (editor && editor.cm) {
-            editor.cm.dispatch({});
-          }
-        }
-      });
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e);
       view.setError(errorMsg);
     }
-  }
-  injectStyles() {
-    let styleEl = document.getElementById("abnt-references-styles");
-    if (!styleEl) {
-      styleEl = document.createElement("style");
-      styleEl.id = "abnt-references-styles";
-      document.head.appendChild(styleEl);
-    }
-    styleEl.textContent = ``;
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -523,12 +519,14 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
     await this.saveData(this.settings);
   }
   async fetchSingleReference(citekey) {
-    if (this.referenceCache.has(citekey)) {
-      const cached = this.referenceCache.get(citekey);
-      if (cached && !cached.error) {
-        return cached;
-      }
-    }
+    const cached = this.referenceCache.get(citekey);
+    if (cached)
+      return cached;
+    const result = await this.lookupReference(citekey);
+    this.referenceCache.set(citekey, result);
+    return result;
+  }
+  async lookupReference(citekey) {
     try {
       const rawResponse = await bbtRequest(
         JSON.stringify({
@@ -540,10 +538,7 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
       );
       const data = JSON.parse(rawResponse);
       if (!data.error && data.result) {
-        const result = { citekey, reference: (data.result || "").trim(), error: void 0 };
-        this.referenceCache.set(citekey, result);
-        await this.saveSettings();
-        return result;
+        return { citekey, reference: (data.result || "").trim(), error: void 0 };
       }
     } catch (localErr) {
     }
@@ -577,10 +572,7 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
               matchedItem = items[0];
             }
             if (matchedItem && matchedItem.bib) {
-              const result = { citekey, reference: matchedItem.bib.trim(), error: void 0 };
-              this.referenceCache.set(citekey, result);
-              await this.saveSettings();
-              return result;
+              return { citekey, reference: matchedItem.bib.trim(), error: void 0 };
             }
           }
         } catch (webErr) {

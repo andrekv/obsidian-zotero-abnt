@@ -66,6 +66,14 @@ function bbtRequest(body: string): Promise<string> {
   });
 }
 
+// ─── Utility: HTML → plain text (decodes &#x..; / &..; entities) ─────────────
+
+function htmlToPlainText(html: string): string {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  return (div.textContent || "").replace(/\s+/g, " ").trim();
+}
+
 // ─── Sidebar View ─────────────────────────────────────────────────────────────
 
 class ABNTView extends ItemView {
@@ -149,8 +157,9 @@ class ABNTView extends ItemView {
         item.addEventListener("contextmenu", async (e) => {
           e.preventDefault();
           const rawRef = res.reference;
-          const plainText = rawRef.replace(/<.*?>/g, "").replace(/\s+/g, " ").trim();
-          const htmlText = `<div>${rawRef.replace(/\s+/g, " ").trim()}</div>`;
+          // textContent decodes HTML entities (&#xED; → í, etc.)
+          const plainText = `[${index + 1}] ` + htmlToPlainText(rawRef);
+          const htmlText = `<div>[${index + 1}] ${rawRef.replace(/\s+/g, " ").trim()}</div>`;
           try {
             const clipboardItem = new (window as any).ClipboardItem({
               "text/plain": new Blob([plainText], { type: "text/plain" }),
@@ -337,7 +346,6 @@ export default class ZoteroABNTPlugin extends Plugin {
     this.addSettingTab(new ZoteroABNTSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_ABNT, (leaf) => new ABNTView(leaf));
     this.registerEditorSuggest(new CitekeySuggest(this.app, this));
-    this.injectStyles();
 
     this.addRibbonIcon("book-open", "Referências ABNT (Zotero)", () => {
       this.activateView();
@@ -352,7 +360,12 @@ export default class ZoteroABNTPlugin extends Plugin {
     this.addCommand({
       id: "refresh-abnt-references",
       name: "Refresh references",
-      callback: () => this.updateReferences()
+      callback: () => {
+        // Retry lookups that failed earlier this session (e.g. Zotero was closed).
+        for (const [k, v] of this.referenceCache)
+          if (v.error) this.referenceCache.delete(k);
+        this.updateReferences();
+      }
     });
 
     this.addCommand({
@@ -365,17 +378,15 @@ export default class ZoteroABNTPlugin extends Plugin {
           return;
         }
 
-        const cleanResults = view.results.filter(r => !r.error);
+        const cleanResults = view.results
+          .map((r, i) => ({ r, i }))
+          .filter(({ r }) => !r.error);
         const plainText = cleanResults
-          .map(r => r.reference
-            .replace(/<.*?>/g, "") // Remove HTML tags
-            .replace(/\s+/g, " ") // Collapse multiple spaces/newlines
-            .trim()
-          )
+          .map(({ r, i }) => `[${i + 1}] ` + htmlToPlainText(r.reference))
           .join("\n"); // One per line
 
         const htmlText = cleanResults
-          .map(r => `<div>${r.reference.replace(/\s+/g, " ").trim()}</div>`)
+          .map(({ r, i }) => `<div>[${i + 1}] ${r.reference.replace(/\s+/g, " ").trim()}</div>`)
           .join("");
 
         try {
@@ -400,10 +411,17 @@ export default class ZoteroABNTPlugin extends Plugin {
         while (node = walker.nextNode()) {
             const text = node.textContent;
             if (text && /\[@([\w:_-]+)\]/.test(text)) {
+                // Build nodes instead of innerHTML so note text is never parsed as HTML.
                 const span = document.createElement("span");
-                span.innerHTML = text.replace(/\[@([\w:_-]+)\]/g, (match, citekey) => {
-                    return `<span class="abnt-citekey-link" data-citekey="${citekey}" style="color: var(--text-accent); cursor: pointer; text-decoration: underline;">${match}</span>`;
-                });
+                let last = 0;
+                for (const m of text.matchAll(/\[@([\w:_-]+)\]/g)) {
+                    span.append(text.slice(last, m.index));
+                    const link = span.createSpan({ cls: "abnt-citekey-link", text: m[0] });
+                    link.dataset.citekey = m[1];
+                    link.style.cssText = "color: var(--text-accent); cursor: pointer; text-decoration: underline;";
+                    last = m.index! + m[0].length;
+                }
+                span.append(text.slice(last));
                 nodesToReplace.push({ textNode: node as Text, span });
             }
         }
@@ -448,8 +466,6 @@ export default class ZoteroABNTPlugin extends Plugin {
   async onunload(): Promise<void> {
     this.referenceCache.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_ABNT);
-    const styleEl = document.getElementById("abnt-references-styles");
-    if (styleEl) styleEl.remove();
   }
 
   private async openCitekeyFile(citekey: string) {
@@ -549,7 +565,9 @@ export default class ZoteroABNTPlugin extends Plugin {
     view.setLoading();
 
     try {
+      const before = this.referenceCache.size;
       const results = await Promise.all(allKeys.map(key => this.fetchSingleReference(key)));
+      if (this.referenceCache.size !== before) await this.saveSettings();
       view.setResults(results);
 
       document.querySelectorAll(".abnt-citekey-link").forEach((link) => {
@@ -559,29 +577,10 @@ export default class ZoteroABNTPlugin extends Plugin {
       document.querySelectorAll('.metadata-property[data-property-key="citekey"]').forEach((propertyEl) => {
         propertyEl.classList.remove("abnt-property-matched", "abnt-property-error");
       });
-
-      this.app.workspace.iterateAllLeaves((leaf) => {
-        if (leaf.view instanceof MarkdownView) {
-          const editor = (leaf.view as any).editor;
-          if (editor && editor.cm) {
-            editor.cm.dispatch({});
-          }
-        }
-      });
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e);
       view.setError(errorMsg);
     }
-  }
-
-  private injectStyles(): void {
-    let styleEl = document.getElementById("abnt-references-styles");
-    if (!styleEl) {
-      styleEl = document.createElement("style");
-      styleEl.id = "abnt-references-styles";
-      document.head.appendChild(styleEl);
-    }
-    styleEl.textContent = ``;
   }
 
   async loadSettings(): Promise<void> {
@@ -605,13 +604,15 @@ export default class ZoteroABNTPlugin extends Plugin {
   }
 
   private async fetchSingleReference(citekey: string): Promise<ReferenceResult> {
-    if (this.referenceCache.has(citekey)) {
-      const cached = this.referenceCache.get(citekey);
-      if (cached && !cached.error) {
-        return cached;
-      }
-    }
+    // Errors are cached in memory only (saveSettings drops them); "Refresh references" retries them.
+    const cached = this.referenceCache.get(citekey);
+    if (cached) return cached;
+    const result = await this.lookupReference(citekey);
+    this.referenceCache.set(citekey, result);
+    return result;
+  }
 
+  private async lookupReference(citekey: string): Promise<ReferenceResult> {
     // 1. Tenta Better BibTeX local primeiro (caso Zotero esteja aberto)
     try {
       const rawResponse = await bbtRequest(
@@ -625,10 +626,7 @@ export default class ZoteroABNTPlugin extends Plugin {
 
       const data = JSON.parse(rawResponse);
       if (!data.error && data.result) {
-        const result: ReferenceResult = { citekey, reference: (data.result || "").trim(), error: undefined };
-        this.referenceCache.set(citekey, result);
-        await this.saveSettings();
-        return result;
+        return { citekey, reference: (data.result || "").trim(), error: undefined };
       }
     } catch (localErr) {
       // Zotero local fechado ou erro de conexão; prossegue para Web API
@@ -664,10 +662,7 @@ export default class ZoteroABNTPlugin extends Plugin {
               matchedItem = items[0];
             }
             if (matchedItem && matchedItem.bib) {
-              const result: ReferenceResult = { citekey, reference: matchedItem.bib.trim(), error: undefined };
-              this.referenceCache.set(citekey, result);
-              await this.saveSettings();
-              return result;
+              return { citekey, reference: matchedItem.bib.trim(), error: undefined };
             }
           }
         } catch (webErr) {
