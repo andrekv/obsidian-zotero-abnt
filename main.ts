@@ -4,7 +4,9 @@ import * as http from "http";
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const VIEW_TYPE_ABNT = "zotero-abnt-references";
-const CITEKEY_REGEX = /\[@([\w:_-]+)\]/g;
+// Any Pandoc citation: [@key], [@key, p. 3], [@a; @b], [-@key], narrative @key.
+// shortcut: a key must end in a year (+ optional letter), so @mentions and @fig:/@tbl: refs are skipped; keys without a year are missed.
+const CITEKEY_REGEX = /(?<![\w@.])-?@([A-Za-z][\w:-]*?\d{4}[a-z]?)(?![\w:-])/g;
 const BBT_HOSTNAME = "127.0.0.1";
 const BBT_PORT = 23119;
 const BBT_PATH = "/better-bibtex/json-rpc";
@@ -195,12 +197,7 @@ class ABNTView extends ItemView {
 
         const editor = leaf.view.editor;
         const content = editor.getValue();
-        let pattern = new RegExp(`\\[@${citekey}\\]`, "g");
-        let match = pattern.exec(content);
-        if (!match) {
-            pattern = new RegExp(`@${citekey}`, "g");
-            match = pattern.exec(content);
-        }
+        const match = new RegExp(`@${citekey}(?![\\w:-])`).exec(content);
 
         if (match) {
             const pos = editor.offsetToPos(match.index);
@@ -214,8 +211,19 @@ class ABNTView extends ItemView {
 }
 
 // ─── Citekey Autocomplete ───────────────────────────────────────────────────
+// Type @ (or [@, -@) plus words from the key, author, title or year.
+// Searches vault literature notes (frontmatter citekey) and, when Zotero is open, the whole Zotero library.
 
-class CitekeySuggest extends EditorSuggest<string> {
+interface CiteHit {
+  key: string;
+  label: string;   // "Marques (2018)"
+  title: string;
+  zoteroOnly: boolean;
+}
+
+const fold = (s: string) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+
+class CitekeySuggest extends EditorSuggest<CiteHit> {
   plugin: ZoteroABNTPlugin;
 
   constructor(app: App, plugin: ZoteroABNTPlugin) {
@@ -224,53 +232,71 @@ class CitekeySuggest extends EditorSuggest<string> {
   }
 
   onTrigger(cursor: EditorPosition, editor: Editor, file: TFile): EditorSuggestTriggerInfo | null {
-    const line = editor.getLine(cursor.line);
-    const sub = line.substring(0, cursor.ch);
-    const match = sub.match(/\[@([\w:_-]*)$/);
-
-    if (match) {
-      return {
-        start: { line: cursor.line, ch: match.index! },
-        end: cursor,
-        query: match[1]
-      };
-    }
-    return null;
+    const sub = editor.getLine(cursor.line).substring(0, cursor.ch);
+    // up to 5 search words after @; stops at brackets, ; or ,
+    const match = sub.match(/(?:^|[\s\[(;])-?@([^\s@\[\];,]*(?: [^\s@\[\];,]+){0,4} ?)$/);
+    if (!match) return null;
+    const query = match[1];
+    // a finished key (letters glued to a year) followed by text: stop suggesting
+    if (/[A-Za-z]\d{4}[a-z]?\s/.test(query)) return null;
+    const at = sub.lastIndexOf("@", cursor.ch - query.length);
+    return { start: { line: cursor.line, ch: at + 1 }, end: cursor, query };
   }
 
-  getSuggestions(context: EditorSuggestContext): string[] {
-    const query = context.query.toLowerCase();
-    const citekeys: string[] = [];
-    const files = this.app.vault.getMarkdownFiles();
-    
-    for (const file of files) {
-      const cache = this.app.metadataCache.getFileCache(file);
-      const fileCitekey = cache?.frontmatter?.citekey;
-      if (fileCitekey) {
-          const keys = Array.isArray(fileCitekey) ? fileCitekey.map(String) : [String(fileCitekey)];
-          keys.forEach(k => {
-              const clean = k.replace(/[\[\]@]/g, "");
-              citekeys.push(clean);
-          });
+  async getSuggestions(context: EditorSuggestContext): Promise<CiteHit[]> {
+    const words = fold(context.query).split(/\s+/).filter(Boolean);
+    const matches = (hay: string) => words.every(w => hay.includes(w));
+    const hits: CiteHit[] = [];
+    const seen = new Set<string>();
+
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      if (!fm?.citekey) continue;
+      const keys = (Array.isArray(fm.citekey) ? fm.citekey : [fm.citekey]).map((k: any) => String(k).replace(/[\[\]"@]/g, "").trim());
+      const authors = (Array.isArray(fm.author) ? fm.author : [fm.author ?? ""]).map((a: any) => String(a).replace(/[\[\]"]/g, ""));
+      const surname = (authors[0] || "").split(",")[0];
+      for (const key of keys) {
+        if (!key || seen.has(key)) continue;
+        const hay = fold([key, file.basename, authors.join(" "), fm.year ?? "", ...(fm.aliases ?? [])].join(" "));
+        if (!matches(hay)) continue;
+        seen.add(key);
+        hits.push({ key, label: `${surname || key} (${fm.year ?? "s.d."})`, title: file.basename.replace(/^\S+\s*/, ""), zoteroOnly: false });
       }
     }
 
-    const uniqueKeys = [...new Set(citekeys)];
-    return uniqueKeys
-      .filter(k => k.toLowerCase().includes(query))
-      .sort()
-      .slice(0, 10);
-  }
-
-  renderSuggestion(value: string, el: HTMLElement): void {
-    el.createEl("div", { text: `[@${value}]` });
-  }
-
-  selectSuggestion(value: string, evt: MouseEvent | KeyboardEvent): void {
-    if (this.context) {
-      const { editor, start, end } = this.context;
-      editor.replaceRange(`[@${value}]`, start, end);
+    // Zotero quick search takes one word; the other words filter the results here.
+    if (words.length && words[0].length >= 3) {
+      try {
+        const raw = await bbtRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "item.search", params: [words[0]] }));
+        for (const it of JSON.parse(raw).result ?? []) {
+          const key = it.citekey || it["citation-key"];
+          if (!key || seen.has(key)) continue;
+          const year = it.issued?.["date-parts"]?.[0]?.[0] ?? "s.d.";
+          const names = (it.author ?? it.editor ?? []).map((a: any) => a.family || a.literal || "");
+          if (!matches(fold([key, it.title ?? "", names.join(" "), year].join(" ")))) continue;
+          seen.add(key);
+          hits.push({ key, label: `${names[0] || key} (${year})`, title: it.title ?? "", zoteroOnly: true });
+        }
+      } catch (e) {
+        // Zotero closed: vault notes only
+      }
     }
+
+    return hits.slice(0, 20);
+  }
+
+  renderSuggestion(hit: CiteHit, el: HTMLElement): void {
+    el.createEl("div", { text: `${hit.label} — ${hit.title}` });
+    el.createEl("small", { text: `@${hit.key}${hit.zoteroOnly ? "  · só no Zotero" : ""}`, cls: "abnt-suggest-key" });
+  }
+
+  selectSuggestion(hit: CiteHit, evt: MouseEvent | KeyboardEvent): void {
+    if (!this.context) return;
+    const { editor, start, end } = this.context;
+    const line = editor.getLine(start.line);
+    const bracketed = /\[-?@$/.test(line.substring(0, start.ch));
+    const close = bracketed && line.charAt(end.ch) !== "]" ? "]" : "";
+    editor.replaceRange(hit.key + close, start, end);
   }
 }
 
@@ -410,11 +436,11 @@ export default class ZoteroABNTPlugin extends Plugin {
         let node;
         while (node = walker.nextNode()) {
             const text = node.textContent;
-            if (text && /\[@([\w:_-]+)\]/.test(text)) {
+            if (text && new RegExp(CITEKEY_REGEX.source).test(text)) {
                 // Build nodes instead of innerHTML so note text is never parsed as HTML.
                 const span = document.createElement("span");
                 let last = 0;
-                for (const m of text.matchAll(/\[@([\w:_-]+)\]/g)) {
+                for (const m of text.matchAll(CITEKEY_REGEX)) {
                     span.append(text.slice(last, m.index));
                     const link = span.createSpan({ cls: "abnt-citekey-link", text: m[0] });
                     link.dataset.citekey = m[1];

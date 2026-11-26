@@ -35,7 +35,7 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var http = __toESM(require("http"));
 var VIEW_TYPE_ABNT = "zotero-abnt-references";
-var CITEKEY_REGEX = /\[@([\w:_-]+)\]/g;
+var CITEKEY_REGEX = /(?<![\w@.])-?@([A-Za-z][\w:-]*?\d{4}[a-z]?)(?![\w:-])/g;
 var BBT_HOSTNAME = "127.0.0.1";
 var BBT_PORT = 23119;
 var BBT_PATH = "/better-bibtex/json-rpc";
@@ -190,12 +190,7 @@ var ABNTView = class extends import_obsidian.ItemView {
       }
       const editor = leaf.view.editor;
       const content = editor.getValue();
-      let pattern = new RegExp(`\\[@${citekey}\\]`, "g");
-      let match = pattern.exec(content);
-      if (!match) {
-        pattern = new RegExp(`@${citekey}`, "g");
-        match = pattern.exec(content);
-      }
+      const match = new RegExp(`@${citekey}(?![\\w:-])`).exec(content);
       if (match) {
         const pos = editor.offsetToPos(match.index);
         editor.setCursor(pos);
@@ -206,51 +201,77 @@ var ABNTView = class extends import_obsidian.ItemView {
     }
   }
 };
+var fold = (s) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
 var CitekeySuggest = class extends import_obsidian.EditorSuggest {
   constructor(app, plugin) {
     super(app);
     this.plugin = plugin;
   }
   onTrigger(cursor, editor, file) {
-    const line = editor.getLine(cursor.line);
-    const sub = line.substring(0, cursor.ch);
-    const match = sub.match(/\[@([\w:_-]*)$/);
-    if (match) {
-      return {
-        start: { line: cursor.line, ch: match.index },
-        end: cursor,
-        query: match[1]
-      };
-    }
-    return null;
+    const sub = editor.getLine(cursor.line).substring(0, cursor.ch);
+    const match = sub.match(/(?:^|[\s\[(;])-?@([^\s@\[\];,]*(?: [^\s@\[\];,]+){0,4} ?)$/);
+    if (!match)
+      return null;
+    const query = match[1];
+    if (/[A-Za-z]\d{4}[a-z]?\s/.test(query))
+      return null;
+    const at = sub.lastIndexOf("@", cursor.ch - query.length);
+    return { start: { line: cursor.line, ch: at + 1 }, end: cursor, query };
   }
-  getSuggestions(context) {
-    var _a;
-    const query = context.query.toLowerCase();
-    const citekeys = [];
-    const files = this.app.vault.getMarkdownFiles();
-    for (const file of files) {
-      const cache = this.app.metadataCache.getFileCache(file);
-      const fileCitekey = (_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.citekey;
-      if (fileCitekey) {
-        const keys = Array.isArray(fileCitekey) ? fileCitekey.map(String) : [String(fileCitekey)];
-        keys.forEach((k) => {
-          const clean = k.replace(/[\[\]@]/g, "");
-          citekeys.push(clean);
-        });
+  async getSuggestions(context) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n;
+    const words = fold(context.query).split(/\s+/).filter(Boolean);
+    const matches = (hay) => words.every((w) => hay.includes(w));
+    const hits = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (_a = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _a.frontmatter;
+      if (!(fm == null ? void 0 : fm.citekey))
+        continue;
+      const keys = (Array.isArray(fm.citekey) ? fm.citekey : [fm.citekey]).map((k) => String(k).replace(/[\[\]"@]/g, "").trim());
+      const authors = (Array.isArray(fm.author) ? fm.author : [(_b = fm.author) != null ? _b : ""]).map((a) => String(a).replace(/[\[\]"]/g, ""));
+      const surname = (authors[0] || "").split(",")[0];
+      for (const key of keys) {
+        if (!key || seen.has(key))
+          continue;
+        const hay = fold([key, file.basename, authors.join(" "), (_c = fm.year) != null ? _c : "", ...(_d = fm.aliases) != null ? _d : []].join(" "));
+        if (!matches(hay))
+          continue;
+        seen.add(key);
+        hits.push({ key, label: `${surname || key} (${(_e = fm.year) != null ? _e : "s.d."})`, title: file.basename.replace(/^\S+\s*/, ""), zoteroOnly: false });
       }
     }
-    const uniqueKeys = [...new Set(citekeys)];
-    return uniqueKeys.filter((k) => k.toLowerCase().includes(query)).sort().slice(0, 10);
-  }
-  renderSuggestion(value, el) {
-    el.createEl("div", { text: `[@${value}]` });
-  }
-  selectSuggestion(value, evt) {
-    if (this.context) {
-      const { editor, start, end } = this.context;
-      editor.replaceRange(`[@${value}]`, start, end);
+    if (words.length && words[0].length >= 3) {
+      try {
+        const raw = await bbtRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "item.search", params: [words[0]] }));
+        for (const it of (_f = JSON.parse(raw).result) != null ? _f : []) {
+          const key = it.citekey || it["citation-key"];
+          if (!key || seen.has(key))
+            continue;
+          const year = (_j = (_i = (_h = (_g = it.issued) == null ? void 0 : _g["date-parts"]) == null ? void 0 : _h[0]) == null ? void 0 : _i[0]) != null ? _j : "s.d.";
+          const names = ((_l = (_k = it.author) != null ? _k : it.editor) != null ? _l : []).map((a) => a.family || a.literal || "");
+          if (!matches(fold([key, (_m = it.title) != null ? _m : "", names.join(" "), year].join(" "))))
+            continue;
+          seen.add(key);
+          hits.push({ key, label: `${names[0] || key} (${year})`, title: (_n = it.title) != null ? _n : "", zoteroOnly: true });
+        }
+      } catch (e) {
+      }
     }
+    return hits.slice(0, 20);
+  }
+  renderSuggestion(hit, el) {
+    el.createEl("div", { text: `${hit.label} \u2014 ${hit.title}` });
+    el.createEl("small", { text: `@${hit.key}${hit.zoteroOnly ? "  \xB7 s\xF3 no Zotero" : ""}`, cls: "abnt-suggest-key" });
+  }
+  selectSuggestion(hit, evt) {
+    if (!this.context)
+      return;
+    const { editor, start, end } = this.context;
+    const line = editor.getLine(start.line);
+    const bracketed = /\[-?@$/.test(line.substring(0, start.ch));
+    const close = bracketed && line.charAt(end.ch) !== "]" ? "]" : "";
+    editor.replaceRange(hit.key + close, start, end);
   }
 };
 var ZoteroABNTSettingTab = class extends import_obsidian.PluginSettingTab {
@@ -345,10 +366,10 @@ var ZoteroABNTPlugin = class extends import_obsidian.Plugin {
       let node;
       while (node = walker.nextNode()) {
         const text = node.textContent;
-        if (text && /\[@([\w:_-]+)\]/.test(text)) {
+        if (text && new RegExp(CITEKEY_REGEX.source).test(text)) {
           const span = document.createElement("span");
           let last = 0;
-          for (const m of text.matchAll(/\[@([\w:_-]+)\]/g)) {
+          for (const m of text.matchAll(CITEKEY_REGEX)) {
             span.append(text.slice(last, m.index));
             const link = span.createSpan({ cls: "abnt-citekey-link", text: m[0] });
             link.dataset.citekey = m[1];
